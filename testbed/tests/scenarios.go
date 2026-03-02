@@ -98,6 +98,15 @@ func createConfigYaml(
 		t.Error("Invalid DataSender type")
 	}
 
+	// Use dynamic ports for the collector's telemetry and pprof extension to avoid "address already in use"
+	telemetryPort := testutil.GetAvailablePort(t)
+	pprofPort := testutil.GetAvailablePort(t)
+
+	serviceExtensionsList := "pprof"
+	if extensionsList.Len() > 0 {
+		serviceExtensionsList = "pprof," + extensionsList.String()
+	}
+
 	format := `
 receivers:%v
 exporters:%v
@@ -106,11 +115,20 @@ processors:
 
 extensions:
   pprof:
+    endpoint: "127.0.0.1:%d"
     save_to_file: %v/cpu.prof
   %s
 
 service:
-  extensions: [pprof, %s]
+  telemetry:
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: "127.0.0.1"
+                port: %d
+  extensions: [%s]
   pipelines:
     %s:
       receivers: [%v]
@@ -124,9 +142,11 @@ service:
 		sender.GenConfigYAMLStr(),
 		receiver.GenConfigYAMLStr(),
 		processorsSections.String(),
+		pprofPort,
 		resultDir,
 		extensionsSections.String(),
-		extensionsList.String(),
+		telemetryPort,
+		serviceExtensionsList,
 		pipeline,
 		sender.ProtocolName(),
 		processorsList.String(),

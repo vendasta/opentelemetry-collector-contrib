@@ -62,6 +62,10 @@ jobs:
           name: testbed-binaries
           path: bin/
       - run: chmod +x bin/*
+      - name: Install KWOK (kwokctl)
+        uses: kubernetes-sigs/kwok@main
+        with:
+          command: kwokctl
       - name: Loadtest
         run: make -C testbed run-tests
         env:

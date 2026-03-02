@@ -1,0 +1,406 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package tests
+
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/clientcmd"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/common/testutil"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/testbed/testbed"
+)
+
+func skipIfKwokUnavailable(t *testing.T) {
+	if os.Getenv("SKIP_KWOK_TESTS") == "1" {
+		t.Skip("Skipping KWOK test: SKIP_KWOK_TESTS=1")
+	}
+	if _, err := exec.LookPath("kwokctl"); err != nil {
+		t.Skipf("Skipping KWOK test: kwokctl not found in PATH (install from https://kwok.sigs.k8s.io/)")
+	}
+}
+
+// kwokNamespaceResourceYAML is a KwokctlResource for "kwokctl scale namespace"
+const kwokNamespaceResourceYAML = `
+apiVersion: config.kwok.x-k8s.io/v1alpha1
+kind: KwokctlResource
+metadata:
+  name: namespace
+parameters: {}
+template: |-
+  apiVersion: v1
+  kind: Namespace
+  metadata:
+    name: {{ Name }}
+`
+
+// kwokDeploymentResourceYAML is a KwokctlResource for "kwokctl scale deployment"
+const kwokDeploymentResourceYAML = `
+apiVersion: config.kwok.x-k8s.io/v1alpha1
+kind: KwokctlResource
+metadata:
+  name: deployment
+parameters:
+  replicas: 1
+  initContainers: []
+  containers:
+  - name: container-0
+    image: registry.k8s.io/pause:3.9
+  hostNetwork: false
+  nodeName: ""
+template: |-
+  apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    name: {{ Name }}
+    namespace: {{ or Namespace "namespace-000000" }}
+  spec:
+    replicas: {{ .replicas }}
+    selector:
+      matchLabels:
+        app: {{ Name }}
+    template:
+      metadata:
+        labels:
+          app: {{ Name }}
+      spec:
+        containers:
+        {{ range $index, $container := .containers }}
+        - name: {{ $container.name }}
+          image: {{ $container.image }}
+        {{ end }}
+        initContainers:
+        {{ range $index, $container := .initContainers }}
+        - name: {{ $container.name }}
+          image: {{ $container.image }}
+        {{ end }}
+        hostNetwork: {{ .hostNetwork }}
+        nodeName: {{ .nodeName }}
+`
+
+// sample metrics consumed by the test pipeline
+// k8s.pod.uid is added at test time from the KWOK-created pod so the processor can associate by pod UID.
+var mockedConsumedMetricsForK8s = func() pmetric.Metrics {
+	md := pmetric.NewMetrics()
+	rm := md.ResourceMetrics().AppendEmpty()
+	rm.Resource().Attributes().PutStr("service.name", "test-service")
+	m := rm.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+	m.SetName("metric-name")
+	m.SetDescription("metric-description")
+	m.SetUnit("metric-unit")
+	m.SetEmptyGauge().DataPoints().AppendEmpty().SetIntValue(0)
+	return md
+}()
+
+type k8sAttributesProcessorTestCase struct {
+	name                  string
+	k8sAttributesConfig   string
+	mockedConsumedMetrics pmetric.Metrics
+	expectedResourceAttrs map[string]any // assert these resource attributes are present (nil = presence only)
+	numPods               int            // pods to create; each in its own namespace and deployment (1 replica)
+}
+
+func getK8sAttributesProcessorTestCases() []k8sAttributesProcessorTestCase {
+	// __CONTEXT__ is replaced at runtime with the current context from the kubeconfig.
+	kwokConfig := `
+  k8s_attributes:
+    auth_type: "kubeConfig"
+    context: "__CONTEXT__"
+    extract:
+      metadata:
+        - k8s.pod.name
+        - k8s.pod.uid
+        - k8s.namespace.name
+        - k8s.node.name
+        - k8s.deployment.name
+    pod_association:
+      - sources:
+          - from: resource_attribute
+            name: k8s.pod.uid
+`
+	expectedAttrs := map[string]any{
+		"k8s.pod.name":        nil,
+		"k8s.namespace.name":  nil,
+		"k8s.pod.uid":         nil,
+		"k8s.node.name":       nil,
+		"k8s.deployment.name": nil,
+	}
+	return []k8sAttributesProcessorTestCase{
+		{
+			name:                  "110_pods_cluster",
+			k8sAttributesConfig:   kwokConfig,
+			mockedConsumedMetrics: mockedConsumedMetricsForK8s,
+			expectedResourceAttrs: expectedAttrs,
+			numPods:               110,
+		},
+		{
+			name:                  "1000_pods_cluster",
+			k8sAttributesConfig:   kwokConfig,
+			mockedConsumedMetrics: mockedConsumedMetricsForK8s,
+			expectedResourceAttrs: expectedAttrs,
+			numPods:               1000,
+		},
+		{
+			name:                  "5000_pods_cluster",
+			k8sAttributesConfig:   kwokConfig,
+			mockedConsumedMetrics: mockedConsumedMetricsForK8s,
+			expectedResourceAttrs: expectedAttrs,
+			numPods:               5000,
+		},
+	}
+}
+
+// numMetricBatches is how many metric batches to send and assert on in the k8sattributes test.
+const numMetricBatches = 10
+
+// setupKWOKCluster creates a KWOK cluster with numPods pods as part of their own Deployment (1 replica).
+// See https://kwok.sigs.k8s.io/
+func setupKWOKCluster(t *testing.T, numPods int) (kubeconfigPath, podUID string, cleanup func()) {
+	clusterName := "otelcol-k8s-" + strings.ReplaceAll(t.Name(), "/", "-")
+	clusterName = strings.ReplaceAll(clusterName, " ", "-")
+	if len(clusterName) > 50 {
+		clusterName = clusterName[:50]
+	}
+
+	create := exec.Command("kwokctl", "create", "cluster", "--disable-qps-limits", "--name", clusterName)
+	create.Dir = t.TempDir()
+	if out, err := create.CombinedOutput(); err != nil {
+		t.Fatalf("kwokctl create cluster: %v\n%s", err, out)
+	}
+
+	var cleanupOnce sync.Once
+	cleanup = func() {
+		cleanupOnce.Do(func() {
+			del := exec.Command("kwokctl", "delete", "cluster", "--name", clusterName)
+			_ = del.Run()
+			deadline := time.Now().Add(30 * time.Second)
+			for time.Now().Before(deadline) {
+				getClusters := exec.Command("kwokctl", "get", "clusters")
+				out, err := getClusters.Output()
+				if err != nil || !strings.Contains(string(out), clusterName) {
+					break
+				}
+				time.Sleep(500 * time.Millisecond)
+			}
+		})
+	}
+
+	getConfig := exec.Command("kwokctl", "get", "kubeconfig", "--name", clusterName)
+	getConfig.Dir = t.TempDir()
+	out, err := getConfig.CombinedOutput()
+	require.NoError(t, err, "kwokctl get kubeconfig: %s", out)
+
+	tmpFile, err := os.CreateTemp(t.TempDir(), "kubeconfig-*.yaml")
+	require.NoError(t, err)
+	_, err = tmpFile.Write(out)
+	require.NoError(t, err)
+	require.NoError(t, tmpFile.Close())
+	kubeconfigPath = tmpFile.Name()
+
+	ctx := t.Context()
+	config, err := clientcmd.BuildConfigFromFlags("", kubeconfigPath)
+	require.NoError(t, err)
+	clientset, err := kubernetes.NewForConfig(config)
+	require.NoError(t, err)
+
+	// Create 100 fake nodes for extra cluster load using kwokctl scale
+	const numNodes = 100
+	// #nosec G204 -- clusterName and numNodes are test-controlled, not user input
+	scaleNodes := exec.Command("kwokctl", "scale", "node", "--replicas", fmt.Sprintf("%d", numNodes), "--name", clusterName)
+	scaleNodes.Dir = t.TempDir()
+	if out, runErr := scaleNodes.CombinedOutput(); runErr != nil {
+		t.Logf("kwokctl scale node (optional): %v\n%s", runErr, out)
+	}
+
+	kwokConfigPath := filepath.Join(t.TempDir(), "kwok-resources.yaml")
+	kwokConfigContent := strings.TrimSpace(kwokNamespaceResourceYAML) + "\n---\n" + strings.TrimSpace(kwokDeploymentResourceYAML)
+	require.NoError(t, os.WriteFile(kwokConfigPath, []byte(kwokConfigContent), 0o600))
+
+	// #nosec G204 -- clusterName, numPods, kwokConfigPath are test-controlled, not user input
+	scaleNS := exec.Command("kwokctl", "scale", "namespace",
+		"--replicas", fmt.Sprintf("%d", numPods),
+		"--serial-length", "6",
+		"--name", clusterName,
+		"--config", kwokConfigPath)
+	scaleNS.Dir = t.TempDir()
+	if out, runErr := scaleNS.CombinedOutput(); runErr != nil {
+		t.Fatalf("kwokctl scale namespace: %v\n%s", runErr, out)
+	}
+
+	// #nosec G204 -- clusterName, numPods, kwokConfigPath are test-controlled, not user input
+	scaleDeploy := exec.Command("kwokctl", "scale", "deployment",
+		"--replicas", fmt.Sprintf("%d", numPods),
+		"--serial-length", "6",
+		"--param", ".replicas=1",
+		"--name", clusterName,
+		"--config", kwokConfigPath)
+	scaleDeploy.Dir = t.TempDir()
+	if out, runErr := scaleDeploy.CombinedOutput(); runErr != nil {
+		t.Fatalf("kwokctl scale deployment: %v\n%s", runErr, out)
+	}
+
+	// Wait until we have numPods pods in namespace-000000 (all deployments go there)
+	podWaitTimeout := min(3*time.Minute+time.Duration(numPods/5)*time.Second, 15*time.Minute)
+	deadline := time.Now().Add(podWaitTimeout)
+	var podCount int
+	for time.Now().Before(deadline) {
+		list, listErr := clientset.CoreV1().Pods("namespace-000000").List(ctx, metav1.ListOptions{})
+		if listErr != nil {
+			time.Sleep(1 * time.Second)
+			continue
+		}
+		podCount = len(list.Items)
+		if podCount >= numPods {
+			break
+		}
+		time.Sleep(1 * time.Second)
+	}
+	require.GreaterOrEqual(t, podCount, numPods, "timed out waiting for %d pods in namespace-000000 (got %d)", numPods, podCount)
+
+	// Get first pod UID in namespace-000000 for metric association
+	list, listErr := clientset.CoreV1().Pods("namespace-000000").List(ctx, metav1.ListOptions{})
+	if listErr == nil && len(list.Items) > 0 {
+		podUID = string(list.Items[0].UID)
+	}
+
+	return kubeconfigPath, podUID, cleanup
+}
+
+// TestMetricK8sAttributesProcessor tests the k8sattributes processor's
+// performance and resource utilization when the component
+// is used to collect k8s metadata from a test k8s cluster
+// with 100 number of nodes, N number of Pods controlled by
+// each own Deployment/Replicaset, while there are also N number of Namespaces
+func TestMetricK8sAttributesProcessor(t *testing.T) {
+	tests := getK8sAttributesProcessorTestCases()
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			skipIfKwokUnavailable(t)
+			kubeconfigPath, podUID, cleanup := setupKWOKCluster(t, test.numPods)
+			defer cleanup()
+			runTestbedWithK8sConfig(t, &test, kubeconfigPath, podUID)
+			cleanup()
+		})
+	}
+}
+
+// getKubeconfigCurrentContext returns the current context name from the kubeconfig at path, or "" on error.
+func getKubeconfigCurrentContext(kubeconfigPath string) string {
+	cmd := exec.Command("kubectl", "config", "current-context")
+	cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfigPath)
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// runTestbedWithK8sConfig runs the testbed flow (child process collector, send metrics, assert).
+// If kubeconfigPath is non-empty, KUBECONFIG is set for the collector process (e.g. for KWOK cluster).
+// If podUID is non-empty, it is set as k8s.pod.uid on the sent metrics so the processor can associate them with the pod.
+func runTestbedWithK8sConfig(t *testing.T, test *k8sAttributesProcessorTestCase, kubeconfigPath, podUID string) {
+	sender := testbed.NewOTLPMetricDataSender(testbed.DefaultHost, testutil.GetAvailablePort(t))
+	receiver := testbed.NewOTLPDataReceiver(testutil.GetAvailablePort(t))
+
+	resultDir, err := filepath.Abs(filepath.Join("results", t.Name()))
+	require.NoError(t, err)
+
+	opts := []testbed.ChildProcessOption{testbed.WithEnvVar("GOMAXPROCS", "2")}
+	if kubeconfigPath != "" {
+		opts = append(opts, testbed.WithEnvVar("KUBECONFIG", kubeconfigPath))
+	}
+	agentProc := testbed.NewChildProcessCollector(opts...)
+	k8sConfigBody := test.k8sAttributesConfig
+	if kubeconfigPath != "" {
+		currentContext := getKubeconfigCurrentContext(kubeconfigPath)
+		k8sConfigBody = strings.Replace(k8sConfigBody, "__CONTEXT__", currentContext, 1)
+	}
+	processors := []ProcessorNameAndConfigBody{
+		{Name: "k8s_attributes", Body: k8sConfigBody},
+	}
+	configStr := createConfigYaml(t, sender, receiver, resultDir, processors, nil)
+	configCleanup, err := agentProc.PrepareConfig(t, configStr)
+	require.NoError(t, err)
+	defer configCleanup()
+
+	options := testbed.LoadOptions{DataItemsPerSecond: 10000, ItemsPerBatch: 10}
+	dataProvider := testbed.NewPerfTestDataProvider(options)
+	tc := testbed.NewTestCase(
+		t,
+		dataProvider,
+		sender,
+		receiver,
+		agentProc,
+		&testbed.PerfTestValidator{},
+		performanceResultsSummary,
+		testbed.WithResourceLimits(testbed.ResourceSpec{
+			ExpectedMaxCPU: 200,
+			ExpectedMaxRAM: 2000,
+		}),
+	)
+	defer tc.Stop()
+
+	tc.StartBackend()
+	tc.StartAgent()
+	defer tc.StopAgent()
+
+	// Allow the k8sattributes processor's informer to sync before sending metrics.
+	syncWait := min(15*time.Second+time.Duration(test.numPods/100)*100*time.Millisecond, 60*time.Second)
+	time.Sleep(syncWait)
+
+	tc.EnableRecording()
+
+	require.NoError(t, sender.Start())
+
+	tc.MockBackend.ClearReceivedItems()
+	startCounter := tc.MockBackend.DataItemsReceived()
+
+	sender, ok := tc.LoadGenerator.(*testbed.ProviderSender).Sender.(testbed.MetricDataSender)
+	require.True(t, ok, "unsupported metric sender")
+
+	for i := range numMetricBatches {
+		metricsToSend := pmetric.NewMetrics()
+		test.mockedConsumedMetrics.CopyTo(metricsToSend)
+		if podUID != "" {
+			metricsToSend.ResourceMetrics().At(0).Resource().Attributes().PutStr("k8s.pod.uid", podUID)
+		}
+		require.NoError(t, sender.ConsumeMetrics(t.Context(), metricsToSend))
+		tc.LoadGenerator.IncDataItemsSent()
+		if i < numMetricBatches-1 {
+			time.Sleep(250 * time.Millisecond)
+		}
+	}
+
+	tc.WaitFor(func() bool { return tc.MockBackend.DataItemsReceived() == startCounter+uint64(numMetricBatches) },
+		"datapoints received")
+
+	received := tc.MockBackend.ReceivedMetrics
+	require.Len(t, received, numMetricBatches, "expected %d metric batches", numMetricBatches)
+	for i := range numMetricBatches {
+		m := received[i]
+		rm := m.ResourceMetrics()
+		require.Equal(t, 1, rm.Len(), "batch %d", i)
+		gotAttrs := rm.At(0).Resource().Attributes().AsRaw()
+		if test.expectedResourceAttrs != nil {
+			for k, v := range test.expectedResourceAttrs {
+				require.Contains(t, gotAttrs, k, "batch %d: missing resource attribute %q", i, k)
+				if v != nil {
+					require.Equal(t, v, gotAttrs[k], "batch %d: resource attribute %q", i, k)
+				}
+			}
+		}
+	}
+}
