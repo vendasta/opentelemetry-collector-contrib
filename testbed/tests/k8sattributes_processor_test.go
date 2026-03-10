@@ -187,7 +187,7 @@ func setupKWOKCluster(t *testing.T, numPods int) (kubeconfigPath, podUID string,
 			_ = del.Run()
 			assert.Eventually(t, func() bool {
 				getClusters := exec.Command("kwokctl", "get", "clusters")
-				out, err := getClusters.Output()
+				out, err = getClusters.Output()
 				return err != nil || !strings.Contains(string(out), clusterName)
 			}, 30*time.Second, 500*time.Millisecond, "cluster %s should be removed", clusterName)
 		})
