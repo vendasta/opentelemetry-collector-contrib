@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -176,30 +177,25 @@ func setupKWOKCluster(t *testing.T, numPods int) (kubeconfigPath, podUID string,
 
 	create := exec.Command("kwokctl", "create", "cluster", "--disable-qps-limits", "--name", clusterName)
 	create.Dir = t.TempDir()
-	if out, err := create.CombinedOutput(); err != nil {
-		t.Fatalf("kwokctl create cluster: %v\n%s", err, out)
-	}
+	out, err := create.CombinedOutput()
+	require.NoError(t, err, "kwokctl create cluster: %s", out)
 
 	var cleanupOnce sync.Once
 	cleanup = func() {
 		cleanupOnce.Do(func() {
 			del := exec.Command("kwokctl", "delete", "cluster", "--name", clusterName)
 			_ = del.Run()
-			deadline := time.Now().Add(30 * time.Second)
-			for time.Now().Before(deadline) {
+			assert.Eventually(t, func() bool {
 				getClusters := exec.Command("kwokctl", "get", "clusters")
 				out, err := getClusters.Output()
-				if err != nil || !strings.Contains(string(out), clusterName) {
-					break
-				}
-				time.Sleep(500 * time.Millisecond)
-			}
+				return err != nil || !strings.Contains(string(out), clusterName)
+			}, 30*time.Second, 500*time.Millisecond, "cluster %s should be removed", clusterName)
 		})
 	}
 
 	getConfig := exec.Command("kwokctl", "get", "kubeconfig", "--name", clusterName)
 	getConfig.Dir = t.TempDir()
-	out, err := getConfig.CombinedOutput()
+	out, err = getConfig.CombinedOutput()
 	require.NoError(t, err, "kwokctl get kubeconfig: %s", out)
 
 	tmpFile, err := os.CreateTemp(t.TempDir(), "kubeconfig-*.yaml")
@@ -251,26 +247,21 @@ func setupKWOKCluster(t *testing.T, numPods int) (kubeconfigPath, podUID string,
 		t.Fatalf("kwokctl scale deployment: %v\n%s", runErr, out)
 	}
 
+	targetNS := "namespace-000000"
 	// Wait until we have numPods pods in namespace-000000 (all deployments go there)
 	podWaitTimeout := min(3*time.Minute+time.Duration(numPods/5)*time.Second, 15*time.Minute)
-	deadline := time.Now().Add(podWaitTimeout)
 	var podCount int
-	for time.Now().Before(deadline) {
-		list, listErr := clientset.CoreV1().Pods("namespace-000000").List(ctx, metav1.ListOptions{})
+	assert.Eventually(t, func() bool {
+		list, listErr := clientset.CoreV1().Pods(targetNS).List(ctx, metav1.ListOptions{})
 		if listErr != nil {
-			time.Sleep(1 * time.Second)
-			continue
+			return false
 		}
 		podCount = len(list.Items)
-		if podCount >= numPods {
-			break
-		}
-		time.Sleep(1 * time.Second)
-	}
-	require.GreaterOrEqual(t, podCount, numPods, "timed out waiting for %d pods in namespace-000000 (got %d)", numPods, podCount)
+		return podCount >= numPods
+	}, podWaitTimeout, 1*time.Second, "timed out waiting for %d pods in namespace-000000 (got %d)", numPods, podCount)
 
 	// Get first pod UID in namespace-000000 for metric association
-	list, listErr := clientset.CoreV1().Pods("namespace-000000").List(ctx, metav1.ListOptions{})
+	list, listErr := clientset.CoreV1().Pods(targetNS).List(ctx, metav1.ListOptions{})
 	if listErr == nil && len(list.Items) > 0 {
 		podUID = string(list.Items[0].UID)
 	}
