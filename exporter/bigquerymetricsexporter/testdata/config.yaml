@@ -1,0 +1,21 @@
+bigquerymetrics:
+  project_id: "my-gcp-project"
+  dataset: "otel_metrics"
+
+bigquerymetrics/full:
+  project_id: "my-gcp-project"
+  dataset: "otel_metrics"
+  location: "EU"
+  create_schema: true
+  credentials_file: "/path/to/credentials.json"
+  partition_granularity: "HOUR"
+  partition_expiration_days: 90
+  metrics_table_name: "custom_metrics"
+  timeout: 60s
+  retry_on_failure:
+    enabled: true
+    initial_interval: 5s
+    max_interval: 30s
+    max_elapsed_time: 300s
+  sending_queue:
+    queue_size: 1000
