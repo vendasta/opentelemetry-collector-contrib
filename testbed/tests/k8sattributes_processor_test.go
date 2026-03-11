@@ -192,6 +192,23 @@ func logKWOKClusterState(t *testing.T, clientset *kubernetes.Clientset, ctx cont
 		}
 		t.Logf("[kwok debug] deployments in %q (%d): %v", targetNS, len(deployList.Items), deployNames)
 	}
+	// List ReplicaSets in target namespace and log first ReplicaSet status (for debugging deployment controller).
+	rsList, err := clientset.AppsV1().ReplicaSets(targetNS).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		t.Logf("[kwok debug] list replicasets in %q: %v", targetNS, err)
+	} else {
+		var rsNames []string
+		for i := range rsList.Items {
+			rsNames = append(rsNames, rsList.Items[i].Name)
+		}
+		t.Logf("[kwok debug] replicasets in %q (%d): %v", targetNS, len(rsList.Items), rsNames)
+		if len(rsList.Items) > 0 {
+			first := &rsList.Items[0]
+			st := first.Status
+			t.Logf("[kwok debug] first replicaset %q status: replicas=%d, ready=%d, available=%d, fullyLabeled=%d, observedGeneration=%d",
+				first.Name, st.Replicas, st.ReadyReplicas, st.AvailableReplicas, st.FullyLabeledReplicas, st.ObservedGeneration)
+		}
+	}
 	// List pods in target namespace
 	podList, err := clientset.CoreV1().Pods(targetNS).List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -213,6 +230,13 @@ func logKWOKClusterState(t *testing.T, clientset *kubernetes.Clientset, ctx cont
 // setupKWOKCluster creates a KWOK cluster with numPods pods as part of their own Deployment (1 replica).
 // See https://kwok.sigs.k8s.io/
 func setupKWOKCluster(t *testing.T, numPods int) (kubeconfigPath, podUID string, cleanup func()) {
+	// Log kwokctl version for debugging CI/runner issues.
+	if verOut, err := exec.Command("kwokctl", "version").CombinedOutput(); err != nil {
+		t.Logf("[kwok] kwokctl version: (failed to get: %v)", err)
+	} else {
+		t.Logf("[kwok] kwokctl version:\n%s", strings.TrimSpace(string(verOut)))
+	}
+
 	clusterName := "otelcol-k8s-" + strings.ReplaceAll(t.Name(), "/", "-")
 	clusterName = strings.ReplaceAll(clusterName, " ", "-")
 	if len(clusterName) > 50 {
