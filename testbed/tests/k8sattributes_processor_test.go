@@ -167,8 +167,8 @@ func getK8sAttributesProcessorTestCases() []k8sAttributesProcessorTestCase {
 // numMetricBatches is how many metric batches to send and assert on in the k8sattributes test.
 const numMetricBatches = 10
 
-// logKWOKClusterState logs namespaces, deployments, and pods in the cluster for debugging when pod count is 0.
-func logKWOKClusterState(ctx context.Context, t *testing.T, clientset *kubernetes.Clientset, targetNS string) {
+// logKWOKClusterState logs namespaces, deployments, pods, and control-plane component logs in the cluster for debugging when pod count is 0.
+func logKWOKClusterState(ctx context.Context, t *testing.T, clientset *kubernetes.Clientset, targetNS, clusterName string) {
 	t.Helper()
 	// List all namespaces
 	nsList, err := clientset.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
@@ -241,6 +241,20 @@ func logKWOKClusterState(ctx context.Context, t *testing.T, clientset *kubernete
 		for j := range evList.Items {
 			ev := &evList.Items[j]
 			t.Logf("[kwok debug]   %s %s %s/%s: %s", ev.LastTimestamp.Time.Format("15:04:05"), ev.Reason, ev.InvolvedObject.Kind, ev.InvolvedObject.Name, ev.Message)
+		}
+	}
+	// Control plane logs (binaries: use kwokctl logs).
+	for _, component := range []string{"kwok-controller", "kube-apiserver", "kube-controller-manager", "kube-scheduler"} {
+		// #nosec G204 -- clusterName is test-controlled
+		cmd := exec.Command("kwokctl", "logs", component, "--name", clusterName)
+		out, err := cmd.CombinedOutput()
+		text := strings.TrimSpace(string(out))
+		if err != nil {
+			t.Logf("[kwok debug] kwokctl logs %s: %v\n%s", component, err, text)
+		} else if text != "" {
+			t.Logf("[kwok debug] kwokctl logs %s:\n%s", component, text)
+		} else {
+			t.Logf("[kwok debug] kwokctl logs %s: (no output)", component)
 		}
 	}
 }
@@ -354,7 +368,7 @@ func setupKWOKCluster(t *testing.T, numPods int) (kubeconfigPath, podUID string,
 			if !debugLogged && attempt >= minAttemptsBeforeDebugLog {
 				debugLogged = true
 				t.Logf("[kwok debug] list pods in %q failed after %d attempts: %v", targetNS, attempt, listErr)
-				logKWOKClusterState(ctx, t, clientset, targetNS)
+				logKWOKClusterState(ctx, t, clientset, targetNS, clusterName)
 			}
 			return false
 		}
@@ -362,7 +376,7 @@ func setupKWOKCluster(t *testing.T, numPods int) (kubeconfigPath, podUID string,
 		if podCount == 0 && !debugLogged && attempt >= minAttemptsBeforeDebugLog {
 			debugLogged = true
 			t.Logf("[kwok debug] got 0 pods in %q after %d attempts, logging cluster state", targetNS, attempt)
-			logKWOKClusterState(ctx, t, clientset, targetNS)
+			logKWOKClusterState(ctx, t, clientset, targetNS, clusterName)
 		}
 		return podCount >= numPods
 	}, podWaitTimeout, 1*time.Second, "timed out waiting for %d pods in namespace-000000 (got %d)", numPods, podCount)
