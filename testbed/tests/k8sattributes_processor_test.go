@@ -4,6 +4,7 @@
 package tests
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -166,6 +167,49 @@ func getK8sAttributesProcessorTestCases() []k8sAttributesProcessorTestCase {
 // numMetricBatches is how many metric batches to send and assert on in the k8sattributes test.
 const numMetricBatches = 10
 
+// logKWOKClusterState logs namespaces, deployments, and pods in the cluster for debugging when pod count is 0.
+func logKWOKClusterState(t *testing.T, clientset *kubernetes.Clientset, ctx context.Context, targetNS string) {
+	t.Helper()
+	// List all namespaces
+	nsList, err := clientset.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		t.Logf("[kwok debug] list namespaces: %v", err)
+		return
+	}
+	var nsNames []string
+	for i := range nsList.Items {
+		nsNames = append(nsNames, nsList.Items[i].Name)
+	}
+	t.Logf("[kwok debug] namespaces (%d): %v", len(nsList.Items), nsNames)
+	// List deployments in target namespace
+	deployList, err := clientset.AppsV1().Deployments(targetNS).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		t.Logf("[kwok debug] list deployments in %q: %v", targetNS, err)
+	} else {
+		var deployNames []string
+		for i := range deployList.Items {
+			deployNames = append(deployNames, deployList.Items[i].Name)
+		}
+		t.Logf("[kwok debug] deployments in %q (%d): %v", targetNS, len(deployList.Items), deployNames)
+	}
+	// List pods in target namespace
+	podList, err := clientset.CoreV1().Pods(targetNS).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		t.Logf("[kwok debug] list pods in %q: %v", targetNS, err)
+	} else {
+		t.Logf("[kwok debug] pods in %q: %d", targetNS, len(podList.Items))
+	}
+	// List deployments and pods across all namespaces (counts per namespace)
+	for _, ns := range nsList.Items {
+		name := ns.Name
+		d, _ := clientset.AppsV1().Deployments(name).List(ctx, metav1.ListOptions{})
+		p, _ := clientset.CoreV1().Pods(name).List(ctx, metav1.ListOptions{})
+		if len(d.Items) > 0 || len(p.Items) > 0 {
+			t.Logf("[kwok debug] namespace %q: %d deployments, %d pods", name, len(d.Items), len(p.Items))
+		}
+	}
+}
+
 // setupKWOKCluster creates a KWOK cluster with numPods pods as part of their own Deployment (1 replica).
 // See https://kwok.sigs.k8s.io/
 func setupKWOKCluster(t *testing.T, numPods int) (kubeconfigPath, podUID string, cleanup func()) {
@@ -175,7 +219,7 @@ func setupKWOKCluster(t *testing.T, numPods int) (kubeconfigPath, podUID string,
 		clusterName = clusterName[:50]
 	}
 
-	create := exec.Command("kwokctl", "create", "cluster", "--disable-qps-limits", "--name", clusterName)
+	create := exec.Command("kwokctl", "create", "cluster", "--disable-qps-limits", "--name", clusterName, "--wait", "5m")
 	create.Dir = t.TempDir()
 	out, err := create.CombinedOutput()
 	require.NoError(t, err, "kwokctl create cluster: %s", out)
@@ -235,6 +279,13 @@ func setupKWOKCluster(t *testing.T, numPods int) (kubeconfigPath, podUID string,
 		t.Fatalf("kwokctl scale namespace: %v\n%s", runErr, out)
 	}
 
+	targetNS := "namespace-000000"
+	// Wait for target namespace to exist before creating deployments (avoids races in CI).
+	assert.Eventually(t, func() bool {
+		_, getErr := clientset.CoreV1().Namespaces().Get(ctx, targetNS, metav1.GetOptions{})
+		return getErr == nil
+	}, 2*time.Minute, 2*time.Second, "namespace %s never created", targetNS)
+
 	// #nosec G204 -- clusterName, numPods, kwokConfigPath are test-controlled, not user input
 	scaleDeploy := exec.Command("kwokctl", "scale", "deployment",
 		"--replicas", fmt.Sprintf("%d", numPods),
@@ -247,16 +298,26 @@ func setupKWOKCluster(t *testing.T, numPods int) (kubeconfigPath, podUID string,
 		t.Fatalf("kwokctl scale deployment: %v\n%s", runErr, out)
 	}
 
-	targetNS := "namespace-000000"
 	// Wait until we have numPods pods in namespace-000000 (all deployments go there)
 	podWaitTimeout := min(3*time.Minute+time.Duration(numPods/5)*time.Second, 15*time.Minute)
 	var podCount int
+	var debugLogged bool
 	assert.Eventually(t, func() bool {
 		list, listErr := clientset.CoreV1().Pods(targetNS).List(ctx, metav1.ListOptions{})
 		if listErr != nil {
+			if !debugLogged {
+				debugLogged = true
+				t.Logf("[kwok debug] list pods in %q failed: %v", targetNS, listErr)
+				logKWOKClusterState(t, clientset, ctx, targetNS)
+			}
 			return false
 		}
 		podCount = len(list.Items)
+		if podCount == 0 && !debugLogged {
+			debugLogged = true
+			t.Logf("[kwok debug] got 0 pods in %q, logging cluster state", targetNS)
+			logKWOKClusterState(t, clientset, ctx, targetNS)
+		}
 		return podCount >= numPods
 	}, podWaitTimeout, 1*time.Second, "timed out waiting for %d pods in namespace-000000 (got %d)", numPods, podCount)
 
