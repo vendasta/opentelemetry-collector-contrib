@@ -168,7 +168,7 @@ func getK8sAttributesProcessorTestCases() []k8sAttributesProcessorTestCase {
 const numMetricBatches = 10
 
 // logKWOKClusterState logs namespaces, deployments, and pods in the cluster for debugging when pod count is 0.
-func logKWOKClusterState(t *testing.T, clientset *kubernetes.Clientset, ctx context.Context, targetNS string) {
+func logKWOKClusterState(ctx context.Context, t *testing.T, clientset *kubernetes.Clientset, targetNS string) {
 	t.Helper()
 	// List all namespaces
 	nsList, err := clientset.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
@@ -218,8 +218,8 @@ func logKWOKClusterState(t *testing.T, clientset *kubernetes.Clientset, ctx cont
 		t.Logf("[kwok debug] pods in %q: %d", targetNS, len(podList.Items))
 	}
 	// List deployments and pods across all namespaces (counts per namespace)
-	for _, ns := range nsList.Items {
-		name := ns.Name
+	for i := range nsList.Items {
+		name := nsList.Items[i].Name
 		d, _ := clientset.AppsV1().Deployments(name).List(ctx, metav1.ListOptions{})
 		p, _ := clientset.CoreV1().Pods(name).List(ctx, metav1.ListOptions{})
 		if len(d.Items) > 0 || len(p.Items) > 0 {
@@ -337,7 +337,7 @@ func setupKWOKCluster(t *testing.T, numPods int) (kubeconfigPath, podUID string,
 			if !debugLogged && attempt >= minAttemptsBeforeDebugLog {
 				debugLogged = true
 				t.Logf("[kwok debug] list pods in %q failed after %d attempts: %v", targetNS, attempt, listErr)
-				logKWOKClusterState(t, clientset, ctx, targetNS)
+				logKWOKClusterState(ctx, t, clientset, targetNS)
 			}
 			return false
 		}
@@ -345,7 +345,7 @@ func setupKWOKCluster(t *testing.T, numPods int) (kubeconfigPath, podUID string,
 		if podCount == 0 && !debugLogged && attempt >= minAttemptsBeforeDebugLog {
 			debugLogged = true
 			t.Logf("[kwok debug] got 0 pods in %q after %d attempts, logging cluster state", targetNS, attempt)
-			logKWOKClusterState(t, clientset, ctx, targetNS)
+			logKWOKClusterState(ctx, t, clientset, targetNS)
 		}
 		return podCount >= numPods
 	}, podWaitTimeout, 1*time.Second, "timed out waiting for %d pods in namespace-000000 (got %d)", numPods, podCount)
