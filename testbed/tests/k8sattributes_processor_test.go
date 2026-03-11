@@ -192,7 +192,6 @@ func logKWOKClusterState(ctx context.Context, t *testing.T, clientset *kubernete
 		}
 		t.Logf("[kwok debug] deployments in %q (%d): %v", targetNS, len(deployList.Items), deployNames)
 	}
-	time.Sleep(2 * time.Second)
 	// List ReplicaSets in target namespace and log first ReplicaSet status (for debugging deployment controller).
 	rsList, err := clientset.AppsV1().ReplicaSets(targetNS).List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -226,6 +225,24 @@ func logKWOKClusterState(ctx context.Context, t *testing.T, clientset *kubernete
 			t.Logf("[kwok debug] namespace %q: %d deployments, %d pods", name, len(d.Items), len(p.Items))
 		}
 	}
+	// Log all cluster events (per namespace) when no pods were created, to help debug reconciliation.
+	const maxEventsPerNS = 50
+	for i := range nsList.Items {
+		nsName := nsList.Items[i].Name
+		evList, err := clientset.CoreV1().Events(nsName).List(ctx, metav1.ListOptions{Limit: maxEventsPerNS})
+		if err != nil {
+			t.Logf("[kwok debug] list events in %q: %v", nsName, err)
+			continue
+		}
+		if len(evList.Items) == 0 {
+			continue
+		}
+		t.Logf("[kwok debug] events in %q (%d):", nsName, len(evList.Items))
+		for j := range evList.Items {
+			ev := &evList.Items[j]
+			t.Logf("[kwok debug]   %s %s %s/%s: %s", ev.LastTimestamp.Time.Format("15:04:05"), ev.Reason, ev.InvolvedObject.Kind, ev.InvolvedObject.Name, ev.Message)
+		}
+	}
 }
 
 // setupKWOKCluster creates a KWOK cluster with numPods pods as part of their own Deployment (1 replica).
@@ -244,7 +261,7 @@ func setupKWOKCluster(t *testing.T, numPods int) (kubeconfigPath, podUID string,
 		clusterName = clusterName[:50]
 	}
 
-	create := exec.Command("kwokctl", "create", "cluster", "--disable-qps-limits", "--name", clusterName)
+	create := exec.Command("kwokctl", "create", "cluster", "--disable-qps-limits", "--runtime", "binary", "--name", clusterName)
 	create.Dir = t.TempDir()
 	out, err := create.CombinedOutput()
 	require.NoError(t, err, "kwokctl create cluster: %s", out)
