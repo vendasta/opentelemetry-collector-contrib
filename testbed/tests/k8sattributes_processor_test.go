@@ -192,6 +192,7 @@ func logKWOKClusterState(t *testing.T, clientset *kubernetes.Clientset, ctx cont
 		}
 		t.Logf("[kwok debug] deployments in %q (%d): %v", targetNS, len(deployList.Items), deployNames)
 	}
+	time.Sleep(2 * time.Second)
 	// List ReplicaSets in target namespace and log first ReplicaSet status (for debugging deployment controller).
 	rsList, err := clientset.AppsV1().ReplicaSets(targetNS).List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -231,7 +232,7 @@ func logKWOKClusterState(t *testing.T, clientset *kubernetes.Clientset, ctx cont
 // See https://kwok.sigs.k8s.io/
 func setupKWOKCluster(t *testing.T, numPods int) (kubeconfigPath, podUID string, cleanup func()) {
 	// Log kwokctl version for debugging CI/runner issues.
-	if verOut, err := exec.Command("kwokctl", "version").CombinedOutput(); err != nil {
+	if verOut, err := exec.Command("kwokctl", "--version").CombinedOutput(); err != nil {
 		t.Logf("[kwok] kwokctl version: (failed to get: %v)", err)
 	} else {
 		t.Logf("[kwok] kwokctl version:\n%s", strings.TrimSpace(string(verOut)))
@@ -243,7 +244,7 @@ func setupKWOKCluster(t *testing.T, numPods int) (kubeconfigPath, podUID string,
 		clusterName = clusterName[:50]
 	}
 
-	create := exec.Command("kwokctl", "create", "cluster", "--disable-qps-limits", "--name", clusterName, "--wait", "5m")
+	create := exec.Command("kwokctl", "create", "cluster", "--disable-qps-limits", "--name", clusterName)
 	create.Dir = t.TempDir()
 	out, err := create.CombinedOutput()
 	require.NoError(t, err, "kwokctl create cluster: %s", out)
@@ -326,20 +327,24 @@ func setupKWOKCluster(t *testing.T, numPods int) (kubeconfigPath, podUID string,
 	podWaitTimeout := min(3*time.Minute+time.Duration(numPods/5)*time.Second, 15*time.Minute)
 	var podCount int
 	var debugLogged bool
+	var attempt int
+	// Minimum attempts before logging cluster state, to give the deployment controller time to create replicasets/pods.
+	const minAttemptsBeforeDebugLog = 10
 	assert.Eventually(t, func() bool {
+		attempt++
 		list, listErr := clientset.CoreV1().Pods(targetNS).List(ctx, metav1.ListOptions{})
 		if listErr != nil {
-			if !debugLogged {
+			if !debugLogged && attempt >= minAttemptsBeforeDebugLog {
 				debugLogged = true
-				t.Logf("[kwok debug] list pods in %q failed: %v", targetNS, listErr)
+				t.Logf("[kwok debug] list pods in %q failed after %d attempts: %v", targetNS, attempt, listErr)
 				logKWOKClusterState(t, clientset, ctx, targetNS)
 			}
 			return false
 		}
 		podCount = len(list.Items)
-		if podCount == 0 && !debugLogged {
+		if podCount == 0 && !debugLogged && attempt >= minAttemptsBeforeDebugLog {
 			debugLogged = true
-			t.Logf("[kwok debug] got 0 pods in %q, logging cluster state", targetNS)
+			t.Logf("[kwok debug] got 0 pods in %q after %d attempts, logging cluster state", targetNS, attempt)
 			logKWOKClusterState(t, clientset, ctx, targetNS)
 		}
 		return podCount >= numPods
