@@ -164,6 +164,47 @@ func TestValidate(t *testing.T) {
 			}(),
 		},
 		{
+			name: "schema_verbosity full is valid",
+			cfg: func() *Config {
+				c := createDefaultConfig()
+				c.ProjectID = "my-project"
+				c.Dataset = "my_dataset"
+				c.SchemaVerbosity = "full"
+				return c
+			}(),
+		},
+		{
+			name: "schema_verbosity compact is valid",
+			cfg: func() *Config {
+				c := createDefaultConfig()
+				c.ProjectID = "my-project"
+				c.Dataset = "my_dataset"
+				c.SchemaVerbosity = "compact"
+				return c
+			}(),
+		},
+		{
+			name: "schema_verbosity case insensitive",
+			cfg: func() *Config {
+				c := createDefaultConfig()
+				c.ProjectID = "my-project"
+				c.Dataset = "my_dataset"
+				c.SchemaVerbosity = "COMPACT"
+				return c
+			}(),
+		},
+		{
+			name: "invalid schema_verbosity",
+			cfg: func() *Config {
+				c := createDefaultConfig()
+				c.ProjectID = "my-project"
+				c.Dataset = "my_dataset"
+				c.SchemaVerbosity = "minimal"
+				return c
+			}(),
+			errContains: "schema_verbosity must be one of full, compact",
+		},
+		{
 			name: "multiple errors",
 			cfg: func() *Config {
 				c := createDefaultConfig()

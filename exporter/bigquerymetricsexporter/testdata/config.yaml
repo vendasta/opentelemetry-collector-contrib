@@ -11,6 +11,7 @@ bigquerymetrics/full:
   partition_granularity: "HOUR"
   partition_expiration_days: 90
   metrics_table_name: "custom_metrics"
+  schema_verbosity: "compact"
   timeout: 60s
   retry_on_failure:
     enabled: true

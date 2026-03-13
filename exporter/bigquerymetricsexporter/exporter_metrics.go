@@ -22,16 +22,15 @@ import (
 
 // metricTypeConfig maps pmetric.MetricType to BQ schema suffix and model constructor.
 var metricTypeConfigs = []struct {
-	metricType  pmetric.MetricType
-	suffix      string
-	schema      bigquery.Schema
-	newModel    func(protoreflect.MessageDescriptor) metrics.MetricsModel
+	metricType pmetric.MetricType
+	suffix     string
+	newModel   func(protoreflect.MessageDescriptor) metrics.MetricsModel
 }{
-	{pmetric.MetricTypeGauge, "_gauge", metrics.SchemaGauge, metrics.NewGaugeMetrics},
-	{pmetric.MetricTypeSum, "_sum", metrics.SchemaSum, metrics.NewSumMetrics},
-	{pmetric.MetricTypeHistogram, "_histogram", metrics.SchemaHistogram, metrics.NewHistogramMetrics},
-	{pmetric.MetricTypeExponentialHistogram, "_exponential_histogram", metrics.SchemaExponentialHistogram, metrics.NewExponentialHistogramMetrics},
-	{pmetric.MetricTypeSummary, "_summary", metrics.SchemaSummary, metrics.NewSummaryMetrics},
+	{pmetric.MetricTypeGauge, "_gauge", metrics.NewGaugeMetrics},
+	{pmetric.MetricTypeSum, "_sum", metrics.NewSumMetrics},
+	{pmetric.MetricTypeHistogram, "_histogram", metrics.NewHistogramMetrics},
+	{pmetric.MetricTypeExponentialHistogram, "_exponential_histogram", metrics.NewExponentialHistogramMetrics},
+	{pmetric.MetricTypeSummary, "_summary", metrics.NewSummaryMetrics},
 }
 
 type metricsExporter struct {
@@ -53,6 +52,11 @@ func newMetricsExporter(cfg *Config, logger *zap.Logger) *metricsExporter {
 
 func (e *metricsExporter) start(ctx context.Context, _ component.Host) error {
 	opts := e.clientOptions()
+	schemas := metrics.BuildSchemas(e.cfg.SchemaVerbosity)
+
+	if e.cfg.SchemaVerbosity == "compact" {
+		e.logger.Warn("schema_verbosity=compact: excluding exemplars, metric_description, resource_schema_url, and scope_* fields from BigQuery schema")
+	}
 
 	startCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -65,7 +69,7 @@ func (e *metricsExporter) start(ctx context.Context, _ component.Host) error {
 	e.client = client
 
 	if e.cfg.CreateSchema {
-		if err := e.ensureSchema(ctx); err != nil {
+		if err := e.ensureSchema(ctx, schemas); err != nil {
 			_ = client.Close()
 			e.client = nil
 			return fmt.Errorf("failed to create schema: %w", err)
@@ -87,7 +91,8 @@ func (e *metricsExporter) start(ctx context.Context, _ component.Host) error {
 	e.modelFactory = make(map[pmetric.MetricType]func(protoreflect.MessageDescriptor) metrics.MetricsModel, len(metricTypeConfigs))
 
 	for _, tc := range metricTypeConfigs {
-		msgDesc, dp, err := metrics.SchemaToDescriptor(tc.schema)
+		schema := schemas[tc.suffix]
+		msgDesc, dp, err := metrics.SchemaToDescriptor(schema)
 		if err != nil {
 			e.closeWriter()
 			return fmt.Errorf("failed to create descriptor for %s: %w", tc.suffix, err)
@@ -159,14 +164,14 @@ func (e *metricsExporter) clientOptions() []option.ClientOption {
 	return opts
 }
 
-func (e *metricsExporter) ensureSchema(ctx context.Context) error {
+func (e *metricsExporter) ensureSchema(ctx context.Context, schemas map[string]bigquery.Schema) error {
 	dataset := e.client.Dataset(e.cfg.Dataset)
 
 	if err := e.ensureDataset(ctx, dataset); err != nil {
 		return err
 	}
 
-	for suffix, schema := range metrics.MetricTypeSchemas {
+	for suffix, schema := range schemas {
 		tableName := e.cfg.TableName(suffix)
 		if err := e.ensureTable(ctx, dataset, tableName, schema); err != nil {
 			return err

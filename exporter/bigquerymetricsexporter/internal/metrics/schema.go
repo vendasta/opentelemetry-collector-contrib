@@ -111,6 +111,39 @@ var MetricTypeSchemas = map[string]bigquery.Schema{
 	"_summary":                  SchemaSummary,
 }
 
+// compactExcludedFields lists fields excluded in compact verbosity mode.
+var compactExcludedFields = map[string]bool{
+	"resource_schema_url":      true,
+	"metric_description":       true,
+	"scope_name":               true,
+	"scope_version":            true,
+	"scope_attributes":         true,
+	"scope_dropped_attr_count": true,
+	"scope_schema_url":         true,
+	"exemplars":                true,
+}
+
+// BuildSchemas returns metric type schemas filtered by the given verbosity level.
+// "full" returns all fields (the shared MetricTypeSchemas — callers must not mutate).
+// "compact" excludes exemplars, metric_description, resource_schema_url, and all scope_* fields.
+func BuildSchemas(verbosity string) map[string]bigquery.Schema {
+	if verbosity != "compact" {
+		return MetricTypeSchemas
+	}
+
+	result := make(map[string]bigquery.Schema, len(MetricTypeSchemas))
+	for suffix, schema := range MetricTypeSchemas {
+		filtered := make(bigquery.Schema, 0, len(schema))
+		for _, f := range schema {
+			if !compactExcludedFields[f.Name] {
+				filtered = append(filtered, f)
+			}
+		}
+		result[suffix] = filtered
+	}
+	return result
+}
+
 // buildSchema constructs a schema by concatenating common fields with type-specific fields.
 func buildSchema(common []*bigquery.FieldSchema, extra ...*bigquery.FieldSchema) bigquery.Schema {
 	schema := make(bigquery.Schema, 0, len(common)+len(extra))

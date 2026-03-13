@@ -68,6 +68,43 @@ func TestSchemaSummary(t *testing.T) {
 	assert.Len(t, qv.Schema, 2)
 }
 
+func TestBuildSchemasFullReturnsAllFields(t *testing.T) {
+	schemas := BuildSchemas("full")
+	assert.Equal(t, MetricTypeSchemas, schemas)
+}
+
+func TestBuildSchemasCompactExcludesFields(t *testing.T) {
+	schemas := BuildSchemas("compact")
+
+	excludedFields := []string{
+		"resource_schema_url", "metric_description",
+		"scope_name", "scope_version", "scope_attributes",
+		"scope_dropped_attr_count", "scope_schema_url",
+	}
+
+	for suffix, schema := range schemas {
+		t.Run(suffix, func(t *testing.T) {
+			// Excluded fields must be absent.
+			for _, name := range excludedFields {
+				assert.Nilf(t, findField(schema, name), "compact schema should not have field %s", name)
+			}
+			// Exemplars must be absent.
+			assert.Nil(t, findField(schema, "exemplars"), "compact schema should not have exemplars")
+
+			// Core fields must still be present.
+			assert.NotNil(t, findField(schema, "resource_attributes"))
+			assert.NotNil(t, findField(schema, "service_name"))
+			assert.NotNil(t, findField(schema, "metric_name"))
+			assert.NotNil(t, findField(schema, "metric_unit"))
+			assert.NotNil(t, findField(schema, "attributes"))
+			assert.NotNil(t, findField(schema, "time_unix"))
+		})
+	}
+
+	// Verify all 5 metric types are present.
+	assert.Len(t, schemas, 5)
+}
+
 func TestMetricTypeSchemas(t *testing.T) {
 	expected := []string{"_gauge", "_sum", "_histogram", "_exponential_histogram", "_summary"}
 	for _, suffix := range expected {

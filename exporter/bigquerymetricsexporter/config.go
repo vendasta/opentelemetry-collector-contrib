@@ -44,12 +44,18 @@ type Config struct {
 
 	// MetricsTableName is the base table name for metrics. Suffixes are auto-appended per metric type. Default: "otel_metrics".
 	MetricsTableName string `mapstructure:"metrics_table_name"`
+
+	// SchemaVerbosity controls how many fields are included in the BigQuery schema.
+	// "full" (default): all fields. "compact": drops exemplars, metric_description,
+	// resource_schema_url, and all scope_* fields.
+	SchemaVerbosity string `mapstructure:"schema_verbosity"`
 }
 
 const (
 	defaultLocation             = "US"
 	defaultPartitionGranularity = "DAY"
 	defaultMetricsTableName     = "otel_metrics"
+	defaultSchemaVerbosity      = "full"
 
 	gaugeSuffix                = "_gauge"
 	sumSuffix                  = "_sum"
@@ -61,6 +67,11 @@ const (
 var (
 	errProjectIDRequired = errors.New("project_id is required")
 	errDatasetRequired   = errors.New("dataset is required")
+
+	validSchemaVerbosities = map[string]bool{
+		"full":    true,
+		"compact": true,
+	}
 
 	// identifierPattern validates BigQuery dataset and table names.
 	// BigQuery allows up to 1024 chars, starting with letter or underscore.
@@ -83,6 +94,7 @@ func createDefaultConfig() *Config {
 		PartitionGranularity:    defaultPartitionGranularity,
 		PartitionExpirationDays: 0,
 		MetricsTableName:        defaultMetricsTableName,
+		SchemaVerbosity:         defaultSchemaVerbosity,
 	}
 }
 
@@ -116,6 +128,13 @@ func (cfg *Config) Validate() error {
 
 	if cfg.CredentialsFile != "" && !filepath.IsAbs(cfg.CredentialsFile) {
 		errs = append(errs, fmt.Errorf("credentials_file must be an absolute path; got %q", cfg.CredentialsFile))
+	}
+
+	verbosity := strings.ToLower(cfg.SchemaVerbosity)
+	if !validSchemaVerbosities[verbosity] {
+		errs = append(errs, fmt.Errorf("schema_verbosity must be one of full, compact; got %q", cfg.SchemaVerbosity))
+	} else {
+		cfg.SchemaVerbosity = verbosity
 	}
 
 	return errors.Join(errs...)
