@@ -78,7 +78,7 @@ func TestBuildSchemasCompactExcludesFields(t *testing.T) {
 
 	excludedFields := []string{
 		"resource_schema_url", "metric_description",
-		"scope_name", "scope_version", "scope_attributes",
+		"scope_name", "scope_version",
 		"scope_dropped_attr_count", "scope_schema_url",
 	}
 
@@ -92,6 +92,7 @@ func TestBuildSchemasCompactExcludesFields(t *testing.T) {
 			assert.Nil(t, findField(schema, "exemplars"), "compact schema should not have exemplars")
 
 			// Core fields must still be present.
+			assert.NotNil(t, findField(schema, "scope_attributes"))
 			assert.NotNil(t, findField(schema, "resource_attributes"))
 			assert.NotNil(t, findField(schema, "service_name"))
 			assert.NotNil(t, findField(schema, "metric_name"))

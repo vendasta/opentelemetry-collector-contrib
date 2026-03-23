@@ -117,7 +117,6 @@ var compactExcludedFields = map[string]bool{
 	"metric_description":       true,
 	"scope_name":               true,
 	"scope_version":            true,
-	"scope_attributes":         true,
 	"scope_dropped_attr_count": true,
 	"scope_schema_url":         true,
 	"exemplars":                true,
@@ -125,7 +124,7 @@ var compactExcludedFields = map[string]bool{
 
 // BuildSchemas returns metric type schemas filtered by the given verbosity level.
 // "full" returns all fields (the shared MetricTypeSchemas — callers must not mutate).
-// "compact" excludes exemplars, metric_description, resource_schema_url, and all scope_* fields.
+// "compact" excludes exemplars, metric_description, resource_schema_url, and most scope_* fields (keeps scope_attributes).
 func BuildSchemas(verbosity string) map[string]bigquery.Schema {
 	if verbosity != "compact" {
 		return MetricTypeSchemas

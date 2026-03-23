@@ -55,7 +55,7 @@ func (e *metricsExporter) start(ctx context.Context, _ component.Host) error {
 	schemas := metrics.BuildSchemas(e.cfg.SchemaVerbosity)
 
 	if e.cfg.SchemaVerbosity == "compact" {
-		e.logger.Warn("schema_verbosity=compact: excluding exemplars, metric_description, resource_schema_url, and scope_* fields from BigQuery schema")
+		e.logger.Warn("schema_verbosity=compact: excluding exemplars, metric_description, resource_schema_url, and most scope_* fields (keeping scope_attributes) from BigQuery schema")
 	}
 
 	startCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
